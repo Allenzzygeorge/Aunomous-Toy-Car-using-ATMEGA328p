@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-// ⭐ FIX: Include the new unified servos module
+//  FIX: Include the new unified servos module
 #include "timer.h"
 #include "servo.h" 
 #include "motor.h"
