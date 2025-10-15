@@ -14,6 +14,7 @@
 // --- System Defines ---
 #define OBSTACLE_DISTANCE_CM 80
 #define PING_INTERVAL_MS     100
+#define TURN_DURATION_MS     1200
 
 // --- Pin Defines ---
 #define TRIGGER_PIN PB3
@@ -71,12 +72,13 @@ int main(void) {
     // --- Main Control Loop (Logic is unchanged) ---
     while (1) {
         uint32_t current_time = millis();
+        motor_update();
 
         switch (current_state) {
             case STATE_INITIAL_WAIT:
                 if (current_time >= 3000) {
                     printString("Initialization complete. Starting motor.\n");
-                    motor_set_speed(125);
+                    motor_set_speed(80);
                     motor_forward();
                     current_state = STATE_DRIVING_FORWARD;
                 }
@@ -137,7 +139,7 @@ int main(void) {
                 }
                 break;
             case STATE_RECOVER_FORWARD:
-                if (current_time - maneuver_start_time >= 750) {
+                if (current_time - maneuver_start_time >= TURN_DURATION_MS) {
                     motor_forward();
                     current_state = STATE_RECOVER_STRAIGHTEN;
                     maneuver_start_time = current_time;

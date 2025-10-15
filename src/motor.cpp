@@ -1,51 +1,81 @@
 #include <avr/io.h>
-#include "motor.h" // Include the header file
+#include "motor.h"
+#include "timer.h" // ⭐ We need access to the millis() timer
 
 // --- Private Pin Defines ---
-// These are only used within this motor module.
-#define ENA_PIN     PD6 // (D6), OC0A for Timer0 PWM speed control
-#define IN1_PIN     PD2 // (D2)
-#define IN2_PIN     PB0 // (D8)
+#define ENA_PIN     PD6
+#define IN1_PIN     PD2
+#define IN2_PIN     PB0
+
+// --- Private Module State Variables ---
+// 'static' makes these variables private to this file.
+static uint8_t cruise_speed = 0;        // The desired speed after the kickstart
+static bool is_kickstarting = false;    // Flag to track if we're in the kickstart phase
+static uint32_t kickstart_start_time = 0; // Timestamp of when the kickstart began
 
 // --- Function Implementations ---
 
 void motor_init(void) {
-    // 1. Set all motor control pins as outputs
     DDRD |= (1 << ENA_PIN) | (1 << IN1_PIN);
     DDRB |= (1 << IN2_PIN);
-
-    // 2. Setup Timer0 for Fast PWM on the ENA pin (PD6/OC0A)
-    // Use non-inverting mode for OC0A, and Fast PWM mode (counts 0-255).
     TCCR0A = (1 << COM0A1) | (1 << WGM01) | (1 << WGM00);
-    
-    // 3. Start the timer with a prescaler of 64.
-    // This gives a PWM frequency of ~977 Hz, which is good for DC motors.
     TCCR0B = (1 << CS01) | (1 << CS00);
-    
-    // Ensure motor is stopped initially
     motor_stop();
 }
 
+// This function now just saves the desired speed. The kickstart logic applies it.
 void motor_set_speed(uint8_t speed) {
-    // Write the speed value directly to the Output Compare Register for Timer0 A.
-    // This controls the PWM duty cycle.
-    OCR0A = speed;
+    cruise_speed = speed;
+    // If we aren't in a kickstart, apply the new speed immediately.
+    // This allows for changing speed while already moving.
+    if (!is_kickstarting) {
+        OCR0A = cruise_speed;
+    }
 }
 
 void motor_forward(void) {
-    // Set IN1 HIGH and IN2 LOW for forward direction
     PORTD |= (1 << IN1_PIN);
     PORTB &= ~(1 << IN2_PIN);
+
+    // Apply the high-power kickstart pulse
+    OCR0A = 140;
+    
+    // Set the state flags for the motor_update() function
+    is_kickstarting = true;
+    kickstart_start_time = millis(); // Record the start time
 }
 
 void motor_backward(void) {
-    // Set IN1 LOW and IN2 HIGH for backward direction
     PORTD &= ~(1 << IN1_PIN);
     PORTB |= (1 << IN2_PIN);
+
+    // Apply the same kickstart logic for reverse
+    OCR0A = 140;
+    is_kickstarting = true;
+    kickstart_start_time = millis();
 }
 
 void motor_stop(void) {
-    // Set both IN1 and IN2 LOW to let the motor coast to a stop.
     PORTD &= ~(1 << IN1_PIN);
     PORTB &= ~(1 << IN2_PIN);
+    
+    // Immediately stop the motor and cancel any kickstart
+    OCR0A = 0;
+    is_kickstarting = false;
+}
+
+// This is the new "heartbeat" for the motor module.
+void motor_update(void) {
+    // Only check the timer if we are in the kickstart state
+    if (is_kickstarting) {
+        // Check if 1000 milliseconds (1 second) have passed
+        if (millis() - kickstart_start_time >= 1000) {
+            // The kickstart period is over.
+            // Settle the motor down to the desired cruising speed.
+            OCR0A = cruise_speed;
+            
+            // Exit the kickstart state
+            is_kickstarting = false;
+        }
+    }
 }

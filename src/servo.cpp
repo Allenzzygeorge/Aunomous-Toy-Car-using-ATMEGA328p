@@ -4,8 +4,8 @@
 // --- Private Position Defines for BOTH Servos ---
 // Steering Servo (PB1 / OC1A)
 #define STEER_POS_CENTER 150
-#define STEER_POS_RIGHT  180
-#define STEER_POS_LEFT   120
+#define STEER_POS_RIGHT  120
+#define STEER_POS_LEFT   180
 
 // Rotation Servo (PB2 / OC1B)
 #define USS_ROT_INITIAL 115
@@ -18,7 +18,7 @@ void servos_init(void) {
     DDRB |= (1 << PB1) | (1 << PB2);
 
     // 2. Configure Timer1 for Fast PWM.
-    // ⭐ FIX: Enable output on BOTH OC1A (PB1) and OC1B (PB2) in one line.
+    //  FIX: Enable output on BOTH OC1A (PB1) and OC1B (PB2) in one line.
     TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
     
     // Set common timer settings (Mode 14, Prescaler 64)
