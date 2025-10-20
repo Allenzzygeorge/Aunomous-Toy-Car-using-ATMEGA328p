@@ -9,8 +9,8 @@
 
 // Rotation Servo (PB2 / OC1B)
 #define USS_ROT_INITIAL 115
-#define USS_ROT_FIRST   170
-#define USS_ROT_SECOND  70
+#define USS_ROT_FIRST   70
+#define USS_ROT_SECOND  170
 
 // --- The Correct, Unified Initialization Function ---
 void servos_init(void) {
