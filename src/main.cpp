@@ -12,34 +12,29 @@
 #include "motor.h"
 
 // --- System Defines ---
-#define OBSTACLE_DISTANCE_CM 80
-#define PING_INTERVAL_MS     100
-#define TURN_DURATION_MS     1200
-#define REVERSE_DURATION_MS  700 // Dedicated constant for reversing time
+#define OBSTACLE_DISTANCE_CM 50
+#define PING_INTERVAL_MS      100
+#define REVERSE_DURATION_MS  300 // The straight reverse for clearance
+
+// --- New Defines for Maneuvering ---
+#define BRAKE_DURATION_MS 100
+#define TURN_REVERSE_DURATION_MS  500
+#define TURN_FORWARD_DURATION_MS  1000
+#define CRUISE_SPEED 140
+#define TURN_SPEED 200
 
 // --- Robust Ultrasonic Sensor Integration ---
-
-// --- Physical Sensor Limits & Configuration ---
 #define MIN_RELIABLE_DISTANCE_CM 2
 #define MAX_RELIABLE_DISTANCE_CM 400
-
-// --- Pin and Timeout Defines ---
 #define TRIGGER_PIN PB3
 #define ECHO_PIN    PB4
-// Timeout for Timer2 with 256 prescaler. Max echo time for 400cm is ~24ms.
-// Timer2 overflows every 4.096ms. Timeout after ~32ms (8 overflows).
 #define MAX_TIMER_OVERFLOWS 8
-
-// --- A Strict State Machine for Measurement ---
 typedef enum {
     STATE_IDLE,
     STATE_WAITING_FOR_ECHO,
     STATE_MEASUREMENT_COMPLETE
 } MeasurementState;
-
 volatile MeasurementState sensor_state = STATE_IDLE;
-
-// --- Global Volatile Variables ---
 #define TIMEOUT_PULSE_COUNT 0xFFFF
 volatile uint16_t pulse_count = 0;
 volatile uint8_t timer_overflow_count = 0;
@@ -50,18 +45,19 @@ volatile uint8_t timer_overflow_count = 0;
 typedef enum {
     STATE_INITIAL_WAIT,
     STATE_DRIVING_FORWARD,
-    STATE_OBSTACLE_REVERSE, // NEW: State for immediate reverse
+    STATE_OBSTACLE_BRAKE,     // NEW: For the short reverse brake
+    STATE_OBSTACLE_REVERSE,   // Original straight reverse
     STATE_SCAN_RIGHT,
     STATE_WAIT_FOR_RIGHT_SCAN,
     STATE_SCAN_LEFT,
     STATE_WAIT_FOR_LEFT_SCAN,
-    STATE_TURN,
-    STATE_RECOVER_FORWARD,
-    STATE_RECOVER_STRAIGHTEN
+    STATE_TURN_REVERSE,       // NEW: Replaces STATE_TURN
+    STATE_TURN_FORWARD,       // NEW: Replaces STATE_RECOVER_FORWARD
+    STATE_RECOVER_STRAIGHTEN, // Waits for turn, then centers servo
+    STATE_WAIT_FOR_SERVO_CENTER // NEW: Waits for servo to center before moving
 } CarState;
 volatile CarState current_state = STATE_INITIAL_WAIT;
 
-// --- ADDED: Variable to store turn decision ---
 typedef enum { TURN_LEFT, TURN_RIGHT } TurnDirection;
 TurnDirection planned_turn = TURN_RIGHT; // Default to right
 
@@ -82,8 +78,6 @@ int main(void) {
     sei(); // Enable global interrupts
 
     printString("\n--- Smart Car Initializing ---\n");
-
-    // --- Set Initial Conditions ---
     motor_stop();
 
     // --- Timestamps and Variables for Logic ---
@@ -95,6 +89,7 @@ int main(void) {
     // --- Main Control Loop ---
     while (1) {
         uint32_t current_time = millis();
+        // This is the heartbeat for the motor kickstart logic
         motor_update();
 
         // --- Car State Machine Logic ---
@@ -102,7 +97,7 @@ int main(void) {
             case STATE_INITIAL_WAIT:
                 if (current_time >= 3000) {
                     printString("Initialization complete. Starting motor.\n");
-                    motor_set_speed(90);
+                    motor_set_speed(CRUISE_SPEED); // MODIFIED
                     motor_forward();
                     current_state = STATE_DRIVING_FORWARD;
                     printString("Status: Moving Forward\n");
@@ -118,7 +113,17 @@ int main(void) {
                 }
                 break;
 
-            // NEW STATE: Car reverses for a set duration after detecting an obstacle.
+            // NEW STATE: Short, high-power reverse brake
+            case STATE_OBSTACLE_BRAKE:
+                if (current_time - maneuver_start_time >= BRAKE_DURATION_MS) {
+                    motor_set_speed(CRUISE_SPEED); // Set for normal reverse
+                    motor_backward(); // Start the long (700ms) reverse
+                    current_state = STATE_OBSTACLE_REVERSE;
+                    maneuver_start_time = current_time;
+                }
+                break;
+
+            // This is the 700ms straight reverse for clearance
             case STATE_OBSTACLE_REVERSE:
                 if (current_time - maneuver_start_time >= REVERSE_DURATION_MS) {
                     motor_stop();
@@ -146,7 +151,7 @@ int main(void) {
             case STATE_SCAN_LEFT:
                 // Give servo time to move before pinging
                 if (current_time - maneuver_start_time >= 1000) {
-                     if (sensor_state == STATE_IDLE) {
+                    if (sensor_state == STATE_IDLE) {
                         trigger_ping();
                         current_state = STATE_WAIT_FOR_LEFT_SCAN;
                     }
@@ -157,38 +162,59 @@ int main(void) {
                 // Wait for the measurement to complete
                 break;
 
-            // MODIFIED: This state now happens AFTER reversing.
-            case STATE_TURN:
-                motor_stop(); // Ensure motor is stopped before turning
-                motor_set_speed(140); // Increase motor speed for the turn
+            // NEW STATE: Replaces STATE_TURN
+            // Does the counter-steer reverse part of the turn
+            case STATE_TURN_REVERSE:
+                motor_stop(); // Ensure motor is stopped
+                motor_set_speed(TURN_SPEED);
                 if (planned_turn == TURN_RIGHT) {
-                    printString("Action: Steering right.\n");
-                    steer_right();
-                } else {
-                    printString("Action: Steering left.\n");
+                    printString("Action: Counter-steering left (reversing).\n");
                     steer_left();
+                } else {
+                    printString("Action: Counter-steering right (reversing).\n");
+                    steer_right();
                 }
-                current_state = STATE_RECOVER_FORWARD;
+                motor_backward();
+                current_state = STATE_TURN_FORWARD;
                 maneuver_start_time = current_time;
                 break;
 
-            case STATE_RECOVER_FORWARD:
-                // A small delay to allow servo to turn before moving forward
-                if (current_time - maneuver_start_time >= 200) {
-                    motor_forward();
-                    // Check total time for the forward part of the turn
-                    if (current_time - maneuver_start_time >= (200 + TURN_DURATION_MS)) {
-                         current_state = STATE_RECOVER_STRAIGHTEN;
-                         maneuver_start_time = current_time;
+            // NEW STATE: Replaces STATE_RECOVER_FORWARD
+            // Waits for reverse, then does the forward-steer part
+            case STATE_TURN_FORWARD:
+                // Wait for the reverse part to finish
+                if (current_time - maneuver_start_time >= TURN_REVERSE_DURATION_MS) {
+                    motor_set_speed(TURN_SPEED); // Keep speed high
+                    if (planned_turn == TURN_RIGHT) {
+                        printString("Action: Steering right (forward).\n");
+                        steer_right();
+                    } else {
+                        printString("Action: Steering left (forward).\n");
+                        steer_left();
                     }
+                    motor_forward();
+                    current_state = STATE_RECOVER_STRAIGHTEN;
+                    maneuver_start_time = current_time; // Reset timer for next state
                 }
                 break;
 
+            // MODIFIED: This state now waits for the forward turn to finish
             case STATE_RECOVER_STRAIGHTEN:
-                if (current_time - maneuver_start_time >= 500) {
-                    printString("Maneuver complete. Resuming drive.\n");
+                if (current_time - maneuver_start_time >= TURN_FORWARD_DURATION_MS) {
+                    printString("Maneuver complete. Straightening...\n");
+                    motor_stop();
                     steer_center();
-                    motor_set_speed(80); // Reset to normal cruising speed
+                    current_state = STATE_WAIT_FOR_SERVO_CENTER; // Go to new wait state
+                    maneuver_start_time = current_time;
+                }
+                break;
+                
+            // NEW STATE: Waits for servo to center before resuming drive
+            case STATE_WAIT_FOR_SERVO_CENTER:
+                if (current_time - maneuver_start_time >= 500) { // 500ms for servo
+                    printString("Resuming drive.\n");
+                    motor_set_speed(CRUISE_SPEED);
+                    motor_forward();
                     current_state = STATE_DRIVING_FORWARD;
                     printString("Status: Moving Forward\n");
                 }
@@ -201,9 +227,11 @@ int main(void) {
             uint16_t distance_cm = 0;
 
             if (pulse_count != TIMEOUT_PULSE_COUNT) {
-                // Combine overflows with the final timer count for total duration
                 uint32_t total_ticks = ((uint32_t)timer_overflow_count * 256) + pulse_count;
-                // Calculate distance for Timer2 with prescaler 256: (total_ticks * 256 / 16) / 58
+                // Calculation: (total_ticks * 256 / 16,000,000) * 34300 / 2
+                // = total_ticks * 0.002744
+                // Your original calculation (total_ticks * 16) / 58 is a great optimization!
+                // It is (total_ticks * 256) / 928, which is 0.002758... close enough!
                 distance_cm = (uint16_t)((total_ticks * 16) / 58);
                 
                 if (distance_cm >= MIN_RELIABLE_DISTANCE_CM && distance_cm <= MAX_RELIABLE_DISTANCE_CM) {
@@ -216,9 +244,11 @@ int main(void) {
                 if (is_valid_measurement) {
                     printString("Distance: "); printNumber(distance_cm); printString(" cm\n");
                     if (distance_cm < OBSTACLE_DISTANCE_CM) {
-                        printString("Obstacle Detected! Status: Reversing\n");
-                        motor_backward(); // Start reversing NOW
-                        current_state = STATE_OBSTACLE_REVERSE; // Go to the new state
+                        // MODIFIED: Go to new BRAKE state first
+                        printString("Obstacle Detected! Braking...\n");
+                        motor_set_speed(TURN_SPEED); // Use high power for brake
+                        motor_backward(); // Reverse immediately
+                        current_state = STATE_OBSTACLE_BRAKE;
                         maneuver_start_time = current_time;
                     }
                 }
@@ -228,11 +258,9 @@ int main(void) {
                     right_distance = distance_cm;
                     printString("Scan Right Distance: "); printNumber(right_distance); printString(" cm\n");
                 } else {
-                    // MODIFIED: Treat out of range as a very large, clear distance.
                     right_distance = 500; 
                     printString("Scan Right: Out of range (Clear Path)\n");
                 }
-                // ALWAYS advance the state and move the servo, even if measurement was invalid
                 printString("Status: Scanning left...\n");
                 uss_rot_second();
                 current_state = STATE_SCAN_LEFT;
@@ -243,12 +271,10 @@ int main(void) {
                     left_distance = distance_cm;
                     printString("Scan Left Distance: "); printNumber(left_distance); printString(" cm\n");
                 } else {
-                     // MODIFIED: Treat out of range as a very large, clear distance.
-                     left_distance = 500;
-                     printString("Scan Left: Out of range (Clear Path)\n");
+                    left_distance = 500;
+                    printString("Scan Left: Out of range (Clear Path)\n");
                 }
                 
-                // This comparison now correctly handles out-of-range values
                 if (right_distance > left_distance) {
                     planned_turn = TURN_RIGHT;
                     printString("Decision: Path right is clearer.\n");
@@ -258,8 +284,8 @@ int main(void) {
                 }
                 uss_rot_initial(); // Center the sensor
                 
-                // Transition directly to the turning state
-                current_state = STATE_TURN;
+                // MODIFIED: Transition to the new turning state
+                current_state = STATE_TURN_REVERSE;
                 maneuver_start_time = current_time;
             }
 
@@ -277,8 +303,11 @@ ISR(PCINT0_vect) {
         if (sensor_state == STATE_WAITING_FOR_ECHO) {
             TCNT2 = 0;
             timer_overflow_count = 0;
-            // Start Timer2 w/ prescaler 256
-            TCCR2B = (1 << CS22);
+            
+            // --- CRITICAL FIX ---
+            // Start Timer2 w/ prescaler 256 (CS22=1, CS21=1)
+            // The old code (1 << CS22) was using prescaler 64, which was wrong.
+            TCCR2B = (1 << CS22) | (1 << CS21);
         }
     } else {
         if (TCCR2B != 0) {
@@ -299,10 +328,12 @@ ISR(TIMER2_OVF_vect) {
 }
 
 void trigger_ping(void) {
-    sensor_state = STATE_WAITING_FOR_ECHO;
-    PORTB |= (1 << TRIGGER_PIN);
-    _delay_us(10);
-    PORTB &= ~(1 << TRIGGER_PIN);
+    if (sensor_state == STATE_IDLE) {
+        sensor_state = STATE_WAITING_FOR_ECHO;
+        PORTB |= (1 << TRIGGER_PIN);
+        _delay_us(10);
+        PORTB &= ~(1 << TRIGGER_PIN);
+    }
 }
 
 void ultrasonic_init(void) {
