@@ -54,6 +54,12 @@ void motor_backward(void) {
     kickstart_start_time = millis();
 }
 
+void motor_suddenbreak(void) {
+    PORTD &= ~(1 << IN1_PIN);
+    PORTB |= (1 << IN2_PIN);
+    OCR0A = 255;
+}
+
 void motor_stop(void) {
     PORTD &= ~(1 << IN1_PIN);
     PORTB &= ~(1 << IN2_PIN);
