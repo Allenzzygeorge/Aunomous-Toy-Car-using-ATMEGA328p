@@ -1,110 +1,178 @@
-#define F_CPU 16000000UL
+#include "main.h"
 
-#include <avr/io.h>
-#include <avr/interrupt.h>
-#include <util/delay.h>
-#include <stdbool.h>
-#include <stdlib.h>
+// ======================================================================
+// --- 1. Global Variable Definitions ---
+// ======================================================================
 
-// Assumed to be present from your project structure
-#include "timer.h"
-#include "servo.h"
-#include "motor.h"
-
-// --- System Defines ---
-#define OBSTACLE_DISTANCE_CM 50
-#define PING_INTERVAL_MS      100
-#define REVERSE_DURATION_MS  300 // The straight reverse for clearance
-
-// --- New Defines for Maneuvering ---
-#define BRAKE_DURATION_MS 100
-#define TURN_REVERSE_DURATION_MS  500
-#define TURN_FORWARD_DURATION_MS  1000
-#define CRUISE_SPEED 110
-#define TURN_SPEED 200
-
-// --- Robust Ultrasonic Sensor Integration ---
-#define MIN_RELIABLE_DISTANCE_CM 2
-#define MAX_RELIABLE_DISTANCE_CM 400
-#define TRIGGER_PIN PB3
-#define ECHO_PIN    PB4
-#define MAX_TIMER_OVERFLOWS 8
-typedef enum {
-    STATE_IDLE,
-    STATE_WAITING_FOR_ECHO,
-    STATE_MEASUREMENT_COMPLETE
-} MeasurementState;
 volatile MeasurementState sensor_state = STATE_IDLE;
-#define TIMEOUT_PULSE_COUNT 0xFFFF
 volatile uint16_t pulse_count = 0;
 volatile uint8_t timer_overflow_count = 0;
-// --- End of Ultrasonic Integration Block ---
-
-
-// --- Car State Machine (MODIFIED) ---
-typedef enum {
-    STATE_INITIAL_WAIT,
-    STATE_DRIVING_FORWARD,
-    STATE_OBSTACLE_BRAKE,     // NEW: For the short reverse brake
-    STATE_OBSTACLE_REVERSE,   // Original straight reverse
-    STATE_SCAN_RIGHT,
-    STATE_WAIT_FOR_RIGHT_SCAN,
-    STATE_SCAN_LEFT,
-    STATE_WAIT_FOR_LEFT_SCAN,
-    STATE_TURN_REVERSE,       // NEW: Replaces STATE_TURN
-    STATE_TURN_FORWARD,       // NEW: Replaces STATE_RECOVER_FORWARD
-    STATE_RECOVER_STRAIGHTEN, // Waits for turn, then centers servo
-    STATE_WAIT_FOR_SERVO_CENTER // NEW: Waits for servo to center before moving
-} CarState;
 volatile CarState current_state = STATE_INITIAL_WAIT;
+TurnDirection planned_turn = TURN_RIGHT; 
+uint16_t last_measured_distance = 0;
+uint8_t current_pwm_speed = 0; 
 
-typedef enum { TURN_LEFT, TURN_RIGHT } TurnDirection;
-TurnDirection planned_turn = TURN_RIGHT; // Default to right
+// Runtime cruise override (defaults to the compiled SPEED_CRUISE)
+volatile uint8_t cruise_pwm = SPEED_CRUISE;
 
-// --- Function Prototypes ---
-void uart_init(void);
-void printString(const char* str);
-void printNumber(int number);
-void ultrasonic_init(void);
-void trigger_ping(void);
+// Serial parser variables
+static unsigned long _timeout_ms = 500;
+static int pushed_back_char = -1;
+
+// --- Define Software Reset Function ---
+void (*soft_reset)(void) = 0;
+
+// ======================================================================
+// --- 2. MAIN FUNCTION ---
+// ======================================================================
 
 int main(void) {
     // --- Hardware Initialization ---
-    uart_init();
-    timer_init(); // Assuming this initializes millis()
-    motor_init();
-    ultrasonic_init();
-    servos_init();
-    sei(); // Enable global interrupts
+    Serial_begin(9600);
+    timer_motor_init(); 
+    ultrasonic_init();  
+    servos_init();      
+    adc_init();         
+    sei();
 
-    printString("\n--- Smart Car Initializing ---\n");
+    Serial_println("\n--- Smart Car Ready ---");
+
+    // --- Set Initial Conditions ---
     motor_stop();
-
-    // --- Timestamps and Variables for Logic ---
-    uint32_t last_ping_time = 0;
+    current_pwm_speed = 0; 
+    
+    // --- Calibrate Current Sensor ---
+    Serial_println("Calibrating current sensor...");
+    _delay_ms(1000); 
+    calibrate_current_sensor();
+    Serial_print("Calibration complete. Zero mV: ");
+    Serial_println((int)zero_current_mV);
+    
+    // --- Timestamps and Variables ---
     uint32_t maneuver_start_time = 0;
     uint16_t right_distance = 0;
     uint16_t left_distance = 0;
+    
+    uint32_t previousMillisPrint = 0;
+    uint32_t last_ping_time = 0; 
+    
+    const uint16_t PING_INTERVAL_MS = 100; 
+    const uint16_t PRINT_INTERVAL = 100; 
+    
+    int motCurrent = 0;
+    const int STALL_CURRENT_THRESHOLD = 2500; // Limit in mA
+    uint8_t over_current_counter = 0;         // <-- NEW: Counter for consecutive high readings
 
     // --- Main Control Loop ---
     while (1) {
         uint32_t current_time = millis();
-        // This is the heartbeat for the motor kickstart logic
-        motor_update();
+
+        // ==============================================================
+        // --- INDEPENDENT SAFETY CHECK (Stall Protection) ---
+        // ==============================================================
+        int safety_current = abs(read_current_mA());
+        
+        if (safety_current > STALL_CURRENT_THRESHOLD) {
+             // Increment counter if current is too high
+             over_current_counter++;
+        } else {
+             // Reset counter if current drops back to normal (must be consecutive)
+             over_current_counter = 0;
+        }
+
+        // Trigger Stop only if we have 5 consecutive bad readings
+        if (over_current_counter >= 56) {
+             motor_stop();
+             current_pwm_speed = 0; 
+             Serial_print("!!! STALL DETECTED (");
+             Serial_print(safety_current);
+             Serial_println("mA) -> EMERGENCY STOP !!!");
+             
+             over_current_counter = 0; // Reset counter after tripping
+             _delay_ms(1000);          // Cool down delay
+        }
+
+        // ==============================================================
+
+        // --- Serial Command Parser ---
+        if (Serial_available()) {
+             char c = Serial_read();
+             
+             if (c == 'x') {
+                 motor_stop();
+                 current_pwm_speed = 0; 
+                 Serial_println("CMD: Motor Stop.");
+             }
+             else if (c == 's') {
+                 Serial_println("CMD: FORCE OBSTACLE SEQUENCE!");
+                 
+                 TCCR2B = 0; 
+                 sensor_state = STATE_IDLE;
+                 
+                 // --- BRAKE FOR 300ms ---
+                 Serial_println("Braking (300ms)...");
+                 motor_set_speed(SPEED_TURN);
+                 motor_backward();   
+                 _delay_ms(300);     
+                 motor_stop();       
+                 current_pwm_speed = 0;
+                 
+                 Serial_println("Looking Right...");
+                 uss_rot_first(); 
+                 
+                 current_state = STATE_SCAN_RIGHT; 
+                 maneuver_start_time = current_time;
+             }
+             else if (c == 'r') {
+                 Serial_println("CMD: Resetting...");
+                 motor_stop();
+                 _delay_ms(100); 
+                 soft_reset();   
+             }
+             else if (c == 'h') {
+                 // Set cruise PWM to 150
+                 cruise_pwm = 150;
+                 Serial_print("CMD: Set cruise PWM -> ");
+                 Serial_println(cruise_pwm);
+
+                 // If currently driving, apply immediately
+                 if (current_state == STATE_DRIVING_FORWARD ||
+                     current_state == STATE_RECOVER_FORWARD ||
+                     current_state == STATE_RECOVER_STRAIGHTEN) {
+                     motor_set_speed(cruise_pwm);
+                     current_pwm_speed = cruise_pwm;
+                 }
+             }
+             else if (c == 'l') {
+                 // Set cruise PWM to 100
+                 cruise_pwm = 100;
+                 Serial_print("CMD: Set cruise PWM -> ");
+                 Serial_println(cruise_pwm);
+
+                 // If currently driving, apply immediately
+                 if (current_state == STATE_DRIVING_FORWARD ||
+                     current_state == STATE_RECOVER_FORWARD ||
+                     current_state == STATE_RECOVER_STRAIGHTEN) {
+                     motor_set_speed(cruise_pwm);
+                     current_pwm_speed = cruise_pwm;
+                 }
+             }
+        } 
 
         // --- Car State Machine Logic ---
         switch (current_state) {
             case STATE_INITIAL_WAIT:
                 if (current_time >= 3000) {
-                    printString("Initialization complete. Starting motor.\n");
-                    motor_set_speed(CRUISE_SPEED); // MODIFIED
+                    Serial_println("Init done. Forward.");
+                    motor_set_speed(cruise_pwm); 
+                    current_pwm_speed = cruise_pwm; 
                     motor_forward();
                     current_state = STATE_DRIVING_FORWARD;
-                    printString("Status: Moving Forward\n");
                 }
                 break;
 
             case STATE_DRIVING_FORWARD:
+                // Checks every 100ms
                 if (current_time - last_ping_time >= PING_INTERVAL_MS) {
                     if (sensor_state == STATE_IDLE) {
                         last_ping_time = current_time;
@@ -113,205 +181,226 @@ int main(void) {
                 }
                 break;
 
-            // NEW STATE: Short, high-power reverse brake
-            case STATE_OBSTACLE_BRAKE:
-                if (current_time - maneuver_start_time >= BRAKE_DURATION_MS) {
-                    motor_set_speed(CRUISE_SPEED); // Set for normal reverse
-                    motor_backward(); // Start the long (700ms) reverse
-                    current_state = STATE_OBSTACLE_REVERSE;
-                    maneuver_start_time = current_time;
-                }
-                break;
-
-            // This is the 700ms straight reverse for clearance
-            case STATE_OBSTACLE_REVERSE:
-                if (current_time - maneuver_start_time >= REVERSE_DURATION_MS) {
-                    motor_stop();
-                    printString("Status: Scanning right...\n");
-                    uss_rot_first();
-                    current_state = STATE_SCAN_RIGHT;
-                    maneuver_start_time = current_time;
-                }
-                break;
-
+            // --- 1. SCAN RIGHT ---
             case STATE_SCAN_RIGHT:
-                // Give servo time to move before pinging
-                if (current_time - maneuver_start_time >= 500) {
-                    if (sensor_state == STATE_IDLE) {
+                if (current_time - maneuver_start_time >= 1000) {
+                    if (sensor_state == STATE_IDLE) { 
                         trigger_ping();
                         current_state = STATE_WAIT_FOR_RIGHT_SCAN;
                     }
                 }
                 break;
 
-            case STATE_WAIT_FOR_RIGHT_SCAN:
-                // Wait for the measurement to complete
-                break;
+            case STATE_WAIT_FOR_RIGHT_SCAN: break; 
 
+            // --- 2. SCAN LEFT ---
             case STATE_SCAN_LEFT:
-                // Give servo time to move before pinging
                 if (current_time - maneuver_start_time >= 1000) {
-                    if (sensor_state == STATE_IDLE) {
+                     if (sensor_state == STATE_IDLE) { 
                         trigger_ping();
                         current_state = STATE_WAIT_FOR_LEFT_SCAN;
                     }
                 }
                 break;
 
-            case STATE_WAIT_FOR_LEFT_SCAN:
-                // Wait for the measurement to complete
-                break;
+            case STATE_WAIT_FOR_LEFT_SCAN: break; // Logic handled in Sensor Block
 
-            // NEW STATE: Replaces STATE_TURN
-            // Does the counter-steer reverse part of the turn
-            case STATE_TURN_REVERSE:
-                motor_stop(); // Ensure motor is stopped
-                motor_set_speed(TURN_SPEED);
+            // --- 3. REVERSE WITH COUNTER STEER ---
+            case STATE_OBSTACLE_REVERSE:
+                
+                motor_set_speed(SPEED_TURN);
+                current_pwm_speed = SPEED_TURN;
+                motor_backward();
+
+                // Counter Steer Logic
                 if (planned_turn == TURN_RIGHT) {
-                    printString("Action: Counter-steering left (reversing).\n");
                     steer_left();
                 } else {
-                    printString("Action: Counter-steering right (reversing).\n");
                     steer_right();
                 }
-                motor_backward();
-                current_state = STATE_TURN_FORWARD;
-                maneuver_start_time = current_time;
-                break;
 
-            // NEW STATE: Replaces STATE_RECOVER_FORWARD
-            // Waits for reverse, then does the forward-steer part
-            case STATE_TURN_FORWARD:
-                // Wait for the reverse part to finish
-                if (current_time - maneuver_start_time >= TURN_REVERSE_DURATION_MS) {
-                    motor_set_speed(TURN_SPEED); // Keep speed high
-                    if (planned_turn == TURN_RIGHT) {
-                        printString("Action: Steering right (forward).\n");
-                        steer_right();
-                    } else {
-                        printString("Action: Steering left (forward).\n");
-                        steer_left();
-                    }
-                    motor_forward();
-                    current_state = STATE_RECOVER_STRAIGHTEN;
-                    maneuver_start_time = current_time; // Reset timer for next state
-                }
-                break;
-
-            // MODIFIED: This state now waits for the forward turn to finish
-            case STATE_RECOVER_STRAIGHTEN:
-                if (current_time - maneuver_start_time >= TURN_FORWARD_DURATION_MS) {
-                    printString("Maneuver complete. Straightening...\n");
+                if (current_time - maneuver_start_time >= REVERSE_DURATION_MS) {
                     motor_stop();
-                    steer_center();
-                    current_state = STATE_WAIT_FOR_SERVO_CENTER; // Go to new wait state
+                    uss_rot_initial(); // Center Sensor
+                    current_state = STATE_TURN;
                     maneuver_start_time = current_time;
                 }
                 break;
+
+            // --- 4. FORWARD WITH CORRECT STEER ---
+            case STATE_TURN:
+                motor_set_speed(SPEED_TURN); 
+                current_pwm_speed = SPEED_TURN; 
                 
-            // NEW STATE: Waits for servo to center before resuming drive
-            case STATE_WAIT_FOR_SERVO_CENTER:
-                if (current_time - maneuver_start_time >= 500) { // 500ms for servo
-                    printString("Resuming drive.\n");
-                    motor_set_speed(CRUISE_SPEED);
-                    motor_forward();
+                // Correct Steer Logic
+                if (planned_turn == TURN_RIGHT) {
+                    Serial_println("Action: Turning right.");
+                    steer_right();
+                } else {
+                    Serial_println("Action: Turning left.");
+                    steer_left();
+                }
+                motor_forward();
+
+                current_state = STATE_RECOVER_FORWARD;
+                maneuver_start_time = current_time;
+                break;
+
+            case STATE_RECOVER_FORWARD:
+                // Checks every 100ms
+                if (current_time - last_ping_time >= PING_INTERVAL_MS) {
+                    if (sensor_state == STATE_IDLE) {
+                        last_ping_time = current_time;
+                        trigger_ping();
+                    }
+                }
+                
+                if (current_time - maneuver_start_time >= TURN_DURATION_MS) {
+                     current_state = STATE_RECOVER_STRAIGHTEN;
+                     maneuver_start_time = current_time;
+                }
+                break;
+
+            case STATE_RECOVER_STRAIGHTEN:
+                // Checks every 100ms
+                if (current_time - last_ping_time >= PING_INTERVAL_MS) {
+                    if (sensor_state == STATE_IDLE) {
+                        last_ping_time = current_time;
+                        trigger_ping();
+                    }
+                }
+
+                if (current_time - maneuver_start_time >= 500) {
+                    Serial_println("Resuming Forward.");
+                    steer_center();
+                    motor_set_speed(cruise_pwm); 
+                    current_pwm_speed = cruise_pwm; 
                     current_state = STATE_DRIVING_FORWARD;
-                    printString("Status: Moving Forward\n");
                 }
                 break;
         }
 
-        // --- Process Sensor Data with Integrated Robust Logic ---
+        // --- Process Sensor Data ---
         if (sensor_state == STATE_MEASUREMENT_COMPLETE) {
             bool is_valid_measurement = false;
             uint16_t distance_cm = 0;
 
             if (pulse_count != TIMEOUT_PULSE_COUNT) {
                 uint32_t total_ticks = ((uint32_t)timer_overflow_count * 256) + pulse_count;
-                // Calculation: (total_ticks * 256 / 16,000,000) * 34300 / 2
-                // = total_ticks * 0.002744
-                // Your original calculation (total_ticks * 16) / 58 is a great optimization!
-                // It is (total_ticks * 256) / 928, which is 0.002758... close enough!
                 distance_cm = (uint16_t)((total_ticks * 16) / 58);
                 
                 if (distance_cm >= MIN_RELIABLE_DISTANCE_CM && distance_cm <= MAX_RELIABLE_DISTANCE_CM) {
                     is_valid_measurement = true;
+                    last_measured_distance = distance_cm;
+                } else {
+                    last_measured_distance = 999; 
+                }
+            } else {
+                last_measured_distance = 999;
+            }
+            
+            // --- GLOBAL OBSTACLE CHECK ---
+            if (is_valid_measurement && distance_cm < OBSTACLE_DISTANCE_CM)
+            {
+                if (current_state == STATE_DRIVING_FORWARD ||
+                    current_state == STATE_RECOVER_FORWARD ||
+                    current_state == STATE_RECOVER_STRAIGHTEN)
+                {
+                    Serial_println("!!! OBSTACLE DETECTED !!!");
+                    
+                    // --- ACTIVE BRAKE (300ms) ---
+                    Serial_println("Action: Active Brake (300ms)!");
+                    motor_set_speed(SPEED_TURN); 
+                    motor_backward();            
+                    _delay_ms(300); 
+                    motor_stop();                
+                    current_pwm_speed = 0;
+                    
+                    Serial_println("Looking Right...");
+                    uss_rot_first(); 
+                    
+                    current_state = STATE_SCAN_RIGHT; 
+                    maneuver_start_time = current_time;
+                    
+                    sensor_state = STATE_IDLE; 
+                    continue; 
                 }
             }
 
-            // --- Part 1: Update logic based on the current state ---
-            if (current_state == STATE_DRIVING_FORWARD) {
-                if (is_valid_measurement) {
-                    printString("Distance: "); printNumber(distance_cm); printString(" cm\n");
-                    if (distance_cm < OBSTACLE_DISTANCE_CM) {
-                        // MODIFIED: Go to new BRAKE state first
-                        printString("Obstacle Detected! Braking...\n");
-                        motor_set_speed(TURN_SPEED); // Use high power for brake
-                        motor_backward(); // Reverse immediately
-                        current_state = STATE_OBSTACLE_BRAKE;
-                        maneuver_start_time = current_time;
-                    }
-                }
-            }
-            else if (current_state == STATE_WAIT_FOR_RIGHT_SCAN) {
+            // --- State-Specific Sensor Logic ---
+            if (current_state == STATE_WAIT_FOR_RIGHT_SCAN) {
                 if (is_valid_measurement) {
                     right_distance = distance_cm;
-                    printString("Scan Right Distance: "); printNumber(right_distance); printString(" cm\n");
+                    Serial_print("Right: "); Serial_println(right_distance);
                 } else {
                     right_distance = 500; 
-                    printString("Scan Right: Out of range (Clear Path)\n");
+                    Serial_println("Right: Clear");
                 }
-                printString("Status: Scanning left...\n");
-                uss_rot_second();
+                Serial_println("Looking Left...");
+                uss_rot_second(); // Look Left
+                
                 current_state = STATE_SCAN_LEFT;
                 maneuver_start_time = current_time;
             }
             else if (current_state == STATE_WAIT_FOR_LEFT_SCAN) {
                 if (is_valid_measurement) {
                     left_distance = distance_cm;
-                    printString("Scan Left Distance: "); printNumber(left_distance); printString(" cm\n");
+                    Serial_print("Left: "); Serial_println(left_distance);
                 } else {
-                    left_distance = 500;
-                    printString("Scan Left: Out of range (Clear Path)\n");
+                     left_distance = 500;
+                     Serial_println("Left: Clear");
                 }
                 
+                // --- DECISION LOGIC ---
                 if (right_distance > left_distance) {
                     planned_turn = TURN_RIGHT;
-                    printString("Decision: Path right is clearer.\n");
+                    Serial_println("Decision: Go Right");
                 } else {
                     planned_turn = TURN_LEFT;
-                    printString("Decision: Path left is clearer.\n");
+                    Serial_println("Decision: Go Left");
                 }
-                uss_rot_initial(); // Center the sensor
                 
-                // MODIFIED: Transition to the new turning state
-                current_state = STATE_TURN_REVERSE;
+                Serial_println("Centering Servo...");
+                uss_rot_initial(); // Center Servo
+                _delay_ms(500); 
+                
+                // --- START REVERSE WITH COUNTER STEER ---
+                Serial_println("Status: Reversing to pivot...");
+                current_state = STATE_OBSTACLE_REVERSE;
                 maneuver_start_time = current_time;
             }
 
-            // Reset the sensor state to allow a new measurement
             sensor_state = STATE_IDLE;
         }
+
+        // --- Serial Print Task ---
+        if (current_time - previousMillisPrint >= PRINT_INTERVAL) {
+            previousMillisPrint = current_time;
+            motCurrent = abs(read_current_mA());
+            Serial_print("D:");
+            if (last_measured_distance == 999) Serial_print("---"); 
+            else Serial_print(last_measured_distance);
+            
+            Serial_print(" C:"); Serial_print(motCurrent);
+            Serial_print(" PWM:"); Serial_println(current_pwm_speed); 
+        }
     }
-    return 0;
+    return 0; 
 }
 
-// --- ISRs and Helper Functions (Updated for Robust Sensor) ---
-
+// ======================================================================
+// --- 3. ISRs (Ultrasonic) (Unchanged) ---
+// ======================================================================
 ISR(PCINT0_vect) {
     if (PINB & (1 << ECHO_PIN)) {
         if (sensor_state == STATE_WAITING_FOR_ECHO) {
             TCNT2 = 0;
             timer_overflow_count = 0;
-            
-            // --- CRITICAL FIX ---
-            // Start Timer2 w/ prescaler 256 (CS22=1, CS21=1)
-            // The old code (1 << CS22) was using prescaler 64, which was wrong.
-            TCCR2B = (1 << CS22) | (1 << CS21);
+            TCCR2B = (1 << CS22); 
         }
     } else {
         if (TCCR2B != 0) {
-            TCCR2B = 0; // Stop timer
+            TCCR2B = 0; 
             pulse_count = TCNT2;
             sensor_state = STATE_MEASUREMENT_COMPLETE;
         }
@@ -321,49 +410,91 @@ ISR(PCINT0_vect) {
 ISR(TIMER2_OVF_vect) {
     timer_overflow_count++;
     if (timer_overflow_count >= MAX_TIMER_OVERFLOWS) {
-        TCCR2B = 0; // Stop the timer
+        TCCR2B = 0; 
         pulse_count = TIMEOUT_PULSE_COUNT;
         sensor_state = STATE_MEASUREMENT_COMPLETE;
     }
 }
 
+// ======================================================================
+// --- 4. Helper Functions (Ultrasonic) (Unchanged) ---
+// ======================================================================
 void trigger_ping(void) {
-    if (sensor_state == STATE_IDLE) {
-        sensor_state = STATE_WAITING_FOR_ECHO;
-        PORTB |= (1 << TRIGGER_PIN);
-        _delay_us(10);
-        PORTB &= ~(1 << TRIGGER_PIN);
-    }
+    sensor_state = STATE_WAITING_FOR_ECHO;
+    PORTB |= (1 << TRIGGER_PIN);
+    _delay_us(10);
+    PORTB &= ~(1 << TRIGGER_PIN);
 }
 
 void ultrasonic_init(void) {
     DDRB |= (1 << TRIGGER_PIN);
     DDRB &= ~(1 << ECHO_PIN);
     PCICR |= (1 << PCIE0);
-    PCMSK0 |= (1 << PCINT4); // Use PCINT4 for PB4
-    // Enable Timer2 Overflow Interrupt
-    TIMSK2 |= (1 << TOIE2);
+    PCMSK0 |= (1 << PCINT4); 
+    TIMSK2 |= (1 << TOIE2); 
 }
 
-// --- UART Functions (Unchanged) ---
-void uart_init(void) {
-    uint16_t ubrr = (F_CPU / (16UL * 9600UL)) - 1;
-    UBRR0H = (uint8_t)(ubrr >> 8);
-    UBRR0L = (uint8_t)(ubrr);
-    UCSR0B = (1 << TXEN0);
-    UCSR0C = (3 << UCSZ00);
+// ======================================================================
+// --- 5. Helper Functions (Serial Parser) (Unchanged except additions) ---
+// ======================================================================
+void Serial_begin(int BAUD) {
+    uint16_t ubrr = (F_CPU / (16UL * BAUD)) - 1;
+    UBRR0H = (ubrr >> 8); 
+    UBRR0L = ubrr;
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0); 
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
-
-void printString(const char* s) {
-    while (*s) {
-        while (!(UCSR0A & (1 << UDRE0)));
-        UDR0 = *s++;
+void uart_putchar(char c) { while (!(UCSR0A & (1 << UDRE0))); UDR0 = c; }
+void uart_print_string(const char *s) { while (*s) uart_putchar(*s++); }
+void uart_print_int(long num) {
+    char buf[12]; int i = 0; bool neg = false;
+    if (num == 0) { uart_putchar('0'); return; }
+    if (num < 0) { neg = true; num = -num; }
+    while (num > 0) { buf[i++] = (num % 10) + '0'; num /= 10; }
+    if (neg) buf[i++] = '-';
+    while (i > 0) uart_putchar(buf[--i]);
+}
+void uart_print_float(double num, int precision) {
+    if (num < 0) { uart_putchar('-'); num = -num; }
+    long int_part = (long)num;
+    double frac = num - int_part;
+    uart_print_int(int_part);
+    uart_putchar('.');
+    for (int i = 0; i < precision; i++) {
+        frac *= 10;
+        int digit = (int)frac;
+        uart_putchar('0' + digit);
+        frac -= digit;
     }
 }
+uint8_t Serial_available(void) { return (UCSR0A & (1 << RXC0)); }
+char Serial_read(void) { while (!(UCSR0A & (1 << RXC0))); return UDR0; }
 
-void printNumber(int n) {
-    char buf[10];
-    itoa(n, buf, 10);
-    printString(buf);
+static int timedRead(void) {
+    if (pushed_back_char != -1) { int c = pushed_back_char; pushed_back_char = -1; return c; }
+    unsigned long start_time = millis();
+    while ((millis() - start_time) < _timeout_ms) { if (Serial_available()) return Serial_read(); }
+    return -1; 
+}
+float Serial_parseFloat(void) {
+    bool is_negative = false; bool has_started = false; bool in_fraction = false;
+    float value = 0.0f; float decimal_divisor = 10.0f; int c;
+    while (1) {
+        c = timedRead(); if (c < 0) break;
+        if (c >= '0' && c <= '9') {
+            has_started = true;
+            if (in_fraction) { value = value + (float)(c - '0') / decimal_divisor; decimal_divisor *= 10.0f; }
+            else { value = value * 10.0f + (c - '0'); }
+        }
+        else if (c == '-' && !has_started) { is_negative = true; has_started = true; }
+        else if (c == '.' && !in_fraction) { has_started = true; in_fraction = true; }
+        else if (has_started) { pushed_back_char = c; break; }
+    }
+    return is_negative ? -value : value;
 }
 
+void Serial_print(const char *s) { uart_print_string(s); }
+void Serial_print(int num) { uart_print_int(num); }
+void Serial_println(const char *s) { uart_print_string(s); uart_putchar('\r'); uart_putchar('\n'); }
+void Serial_println(int num) { uart_print_int(num); uart_putchar('\r'); uart_putchar('\n'); }
+void Serial_printFloat(double num, int precision) { uart_print_float(num, precision); }
