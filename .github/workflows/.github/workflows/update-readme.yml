@@ -1,0 +1,82 @@
+name: Auto Update README
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # runs daily at 00:00 UTC (adjust if you want)
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  render-readme:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Render README from template
+        env:
+          GITHUB_USER: Allenzzygeorge
+          REPO_NAME: Aunomous-Toy-Car-using-ATMEGA328p
+        run: |
+          python - <<'PY'
+          import datetime, os, sys, pathlib
+          usr = os.environ['GITHUB_USER']
+          repo = os.environ['REPO_NAME']
+          tpl_path = pathlib.Path('README_TEMPLATE.md')
+          out_path = pathlib.Path('README.md')
+          if not tpl_path.exists():
+              print("README_TEMPLATE.md not found", file=sys.stderr)
+              sys.exit(1)
+          tpl = tpl_path.read_text(encoding='utf-8')
+
+          now = datetime.datetime.utcnow()
+          date_str = now.strftime("%Y-%m-%d %H:%M UTC")
+
+          # build dynamic cards/markdown
+          stats_md = f"![GitHub stats](https://github-readme-stats.vercel.app/api?username={usr}&show_icons=true&count_private=true&theme=default)"
+          top_langs_md = f"![Top Langs](https://github-readme-stats.vercel.app/api/top-langs/?username={usr}&layout=compact&theme=default)"
+          streak_md = f"![GitHub Streak](https://streak-stats.demolab.com?user={usr}&theme=dark)"
+
+          # badges (shields)
+          badges = []
+          badges.append(f"[![Repo size](https://img.shields.io/github/repo-size/{usr}/{repo})](https://github.com/{usr}/{repo})")
+          badges.append(f"[![License](https://img.shields.io/github/license/{usr}/{repo})](https://github.com/{usr}/{repo}/blob/main/LICENSE)")
+          badges.append(f"[![Stars](https://img.shields.io/github/stars/{usr}/{repo}?style=social)](https://github.com/{usr}/{repo}/stargazers)")
+          badges.append(f"[![Issues](https://img.shields.io/github/issues/{usr}/{repo})](https://github.com/{usr}/{repo}/issues)")
+          badges_md = ' '.join(badges)
+
+          replacements = {
+              '{{DATE}}': date_str,
+              '{{GITHUB_STATS}}': stats_md,
+              '{{TOP_LANGS}}': top_langs_md,
+              '{{STREAK}}': streak_md,
+              '{{BADGES}}': badges_md
+          }
+
+          out = tpl
+          for k,v in replacements.items():
+              out = out.replace(k, v)
+
+          out_path.write_text(out, encoding='utf-8')
+          print("Rendered README.md")
+
+      - name: Commit README changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: auto-update README"
+            git push
+          fi
