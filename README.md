@@ -2,7 +2,7 @@
 
 > Autonomous toy car project built around the ATMEGA328p — obstacle avoidance, motor control and remote programming.
 
-**Last updated:** 2025-12-08 11:45 UTC
+**Last updated:** 2025-12-08 11:49 UTC
 
 ---
 
@@ -15,12 +15,12 @@
 
 
 
-![GitHub Streak](https://streak-stats.demolab.com?user=Allenzzygeorge&theme=dark)
+{{STREAK}}
 
 ---
 
 ## Badges
-[![Repo size](https://img.shields.io/github/repo-size/Allenzzygeorge/Aunomous-Toy-Car-using-ATMEGA328p)](https://github.com/Allenzzygeorge/Aunomous-Toy-Car-using-ATMEGA328p) [![License](https://img.shields.io/github/license/Allenzzygeorge/Aunomous-Toy-Car-using-ATMEGA328p)](https://github.com/Allenzzygeorge/Aunomous-Toy-Car-using-ATMEGA328p/blob/main/LICENSE) [![Stars](https://img.shields.io/github/stars/Allenzzygeorge/Aunomous-Toy-Car-using-ATMEGA328p?style=social)](https://github.com/Allenzzygeorge/Aunomous-Toy-Car-using-ATMEGA328p/stargazers) [![Issues](https://img.shields.io/github/issues/Allenzzygeorge/Aunomous-Toy-Car-using-ATMEGA328p)](https://github.com/Allenzzygeorge/Aunomous-Toy-Car-using-ATMEGA328p/issues)
+{{BADGES}}
 
 ---
 
